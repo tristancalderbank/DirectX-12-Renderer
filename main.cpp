@@ -13,9 +13,13 @@
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <DirectXMath.h>
+#include <dxcapi.h>
 
 // DirectX 12 extension library
 #include "d3dx12.h"
+
+// NVidia DXR Helpers
+#include "dxr/TopLevelASGenerator.h"
 
 // STL
 #include <algorithm>
@@ -26,6 +30,7 @@
 
 // helpers
 #include "helpers.h"
+#include "raytracing.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -46,7 +51,7 @@ ComPtr<ID3D12Device5> gDevice;
 ComPtr<ID3D12CommandQueue> gCommandQueue;
 ComPtr<IDXGISwapChain4> gSwapChain;
 ComPtr<ID3D12Resource> gBackBuffers[gNumFrames];
-ComPtr<ID3D12GraphicsCommandList> gCommandList;
+ComPtr<ID3D12GraphicsCommandList4> gCommandList;
 ComPtr<ID3D12CommandAllocator> gCommandAllocators[gNumFrames];
 ComPtr<ID3D12DescriptorHeap> gRTVDescriptorHeap; // render target view
 ComPtr<ID3D12RootSignature> gRootSignature;
@@ -57,14 +62,33 @@ UINT gRTVDescriptorSize;
 UINT gCurrentBackBufferIndex;
 
 // DirectX 12 resources
-struct Vertex
-{
-	float position[3];
-	float color[4];
-};
-
 ComPtr<ID3D12Resource> gVertexBuffer;
 D3D12_VERTEX_BUFFER_VIEW gVertexBufferView;
+
+// DXR specific stuff 
+
+ComPtr<ID3D12Resource> gBLAS;
+
+nv_helpers_dx12::TopLevelASGenerator gTopLevelASGenerator;
+AccelerationStructureBuffers gTopLevelASBuffers;
+AccelerationStructureBuffers gBottomLevelASBuffers;
+
+ComPtr<IDxcBlob> gRayGenLibrary;
+ComPtr<IDxcBlob> gHitLibrary;
+ComPtr<IDxcBlob> gMissLibrary;
+
+ComPtr<ID3D12RootSignature> gRayGenSignature;
+ComPtr<ID3D12RootSignature> gHitSignature;
+ComPtr<ID3D12RootSignature> gMissSignature;
+
+ComPtr<ID3D12StateObject> gRaytracingPipelineState;
+ComPtr<ID3D12StateObjectProperties> gRaytracingStateObjectProperties;
+
+ComPtr<ID3D12Resource> gRaytracingOutputBuffer; // The UAV buffer that the RT writes to (gets copied to RTV)
+ComPtr<ID3D12DescriptorHeap> gSrvUavHeap; // holds descriptor to the RT output buffer 
+
+nv_helpers_dx12::ShaderBindingTableGenerator gSBTGenerator;
+ComPtr<ID3D12Resource> gSBTStorage;
 
 // syncronization stuff
 
@@ -73,11 +97,12 @@ uint64_t gFenceValue = 0;
 uint64_t gFrameFenceValues[gNumFrames] = {};
 HANDLE gFenceEvent;
 
-// presentation stuff
+// settings
 
 bool gVSync = true; // toggle with v key
 bool gTearingSupported = false;
 bool gFullscreen = false; // toggle with Alt + Enter or F11
+bool gRayTracingEnabled = false;
 
 // Window callback function forward decl
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -101,7 +126,7 @@ void parseCommandLineArguments() {
 	::LocalFree(argv);
 }
 
-ComPtr<ID3D12CommandQueue> createCommandQueue(ComPtr<ID3D12Device2> device, D3D12_COMMAND_LIST_TYPE type) {
+ComPtr<ID3D12CommandQueue> createCommandQueue(ComPtr<ID3D12Device5> device, D3D12_COMMAND_LIST_TYPE type) {
 	ComPtr<ID3D12CommandQueue> d3d12CommandQueue;
 
 	D3D12_COMMAND_QUEUE_DESC desc = {};
@@ -115,7 +140,7 @@ ComPtr<ID3D12CommandQueue> createCommandQueue(ComPtr<ID3D12Device2> device, D3D1
 	return d3d12CommandQueue;
 }
 
-ComPtr<ID3D12Fence> createFence(ComPtr<ID3D12Device2> device) {
+ComPtr<ID3D12Fence> createFence(ComPtr<ID3D12Device5> device) {
 	ComPtr<ID3D12Fence> fence;
 
 	throwIfFailed(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
@@ -196,8 +221,8 @@ void render() {
 		gCommandList->RSSetScissorRects(1, &gScissorRect);
 	}
 
-	// Clear the render target
-	{
+	// Raster
+	if (!gRayTracingEnabled) {
 		// transition backbuffer state from present to render target 
 		CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		gCommandList->ResourceBarrier(1, &barrier);
@@ -207,15 +232,76 @@ void render() {
 
 		gCommandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
-		FLOAT clearColor[] = { 0.7f, 0.7f, 0.7f, 1.0f };
+		FLOAT clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
 		gCommandList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
-	}
 
-	// Draw triangle 
-	{
+		// Draw triangle 
 		gCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		gCommandList->IASetVertexBuffers(0, 1, &gVertexBufferView);
 		gCommandList->DrawInstanced(3, 1, 0, 0);
+	}
+	else {
+	// RT
+		// Bind the descriptor heap giving access to RT output buffer as well as TLAS 
+		std::vector<ID3D12DescriptorHeap*> heaps = { gSrvUavHeap.Get() };
+
+		gCommandList->SetDescriptorHeaps(static_cast<UINT>(heaps.size()), heaps.data());
+
+		// Prepare RT output buffer
+		CD3DX12_RESOURCE_BARRIER transition = CD3DX12_RESOURCE_BARRIER::Transition(gRaytracingOutputBuffer.Get(), 
+			D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+		gCommandList->ResourceBarrier(1, &transition);
+
+		// Set up raytracing task 
+		D3D12_DISPATCH_RAYS_DESC desc = {};
+
+		// Layout of the SBT is as follows 
+		// ray generation shader
+		// miss shaders
+		// hit groups
+		
+		// All SBT entries of the  same type have the same size to allow fixed stride 
+
+		uint32_t rayGenerationSectionSizeInBytes = gSBTGenerator.GetRayGenSectionSize();
+		desc.RayGenerationShaderRecord.StartAddress = gSBTStorage->GetGPUVirtualAddress();
+		desc.RayGenerationShaderRecord.SizeInBytes = rayGenerationSectionSizeInBytes;
+
+		uint32_t missSectionSizeInBytes = gSBTGenerator.GetMissSectionSize();
+		desc.MissShaderTable.StartAddress = gSBTStorage->GetGPUVirtualAddress() + rayGenerationSectionSizeInBytes;
+		desc.MissShaderTable.SizeInBytes = missSectionSizeInBytes;
+		desc.MissShaderTable.StrideInBytes = gSBTGenerator.GetMissEntrySize();
+
+		uint32_t hitGroupsSectionSize = gSBTGenerator.GetHitGroupSectionSize();
+		desc.HitGroupTable.StartAddress = gSBTStorage->GetGPUVirtualAddress() + rayGenerationSectionSizeInBytes + missSectionSizeInBytes;
+		desc.HitGroupTable.SizeInBytes = hitGroupsSectionSize;
+		desc.HitGroupTable.StrideInBytes = gSBTGenerator.GetHitGroupEntrySize();
+
+		desc.Width = gClientWidth;
+		desc.Height = gClientHeight;
+		desc.Depth = 1;
+
+		// bind RT pipeline
+		gCommandList->SetPipelineState1(gRaytracingPipelineState.Get());
+
+		// Dispatch the rays, which writes to RT output buffer
+		gCommandList->DispatchRays(&desc);
+
+		// Now copy RT output buffer to the render target 
+		transition = CD3DX12_RESOURCE_BARRIER::Transition(gRaytracingOutputBuffer.Get(),
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); 
+
+		gCommandList->ResourceBarrier(1, &transition);
+
+		transition = CD3DX12_RESOURCE_BARRIER::Transition(backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+
+		gCommandList->ResourceBarrier(1, &transition);
+
+		gCommandList->CopyResource(backBuffer.Get(), gRaytracingOutputBuffer.Get());
+
+		transition = CD3DX12_RESOURCE_BARRIER::Transition(backBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+		gCommandList->ResourceBarrier(1, &transition);
 	}
 
 	// Present
@@ -230,7 +316,7 @@ void render() {
 		throwIfFailed(gCommandList->Close());
 
 		ID3D12CommandList* const commandLists[] = {
-			gCommandList.Get()
+			gCommandList.Get() 
 		};
 
 		gCommandQueue->ExecuteCommandLists(_countof(commandLists), commandLists);
@@ -247,7 +333,7 @@ void render() {
 	}
 }
 
-void updateRenderTargetViews(ComPtr<ID3D12Device2> device,
+void updateRenderTargetViews(ComPtr<ID3D12Device5> device,
 	ComPtr<IDXGISwapChain4> swapChain, ComPtr<ID3D12DescriptorHeap> descriptorHeap) {
 	auto rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
@@ -366,6 +452,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 			{
 			case 'V':
 				gVSync = !gVSync;
+				break;
+			case VK_SPACE:
+				gRayTracingEnabled = !gRayTracingEnabled;
+
+				if (gRayTracingEnabled) {
+					::SetWindowText(ghWnd, "Unreal Engine 6 (RTX: on)");
+				}
+				else {
+					::SetWindowText(ghWnd, "Unreal Engine 6 (RTX: off)");
+				}
+
 				break;
 			case VK_ESCAPE:
 				::PostQuitMessage(0);
@@ -496,7 +593,7 @@ HWND createWindow(const wchar_t* windowClassName, HINSTANCE hInst,
 ComPtr<ID3D12Device5>
 createDevice(ComPtr<IDXGIAdapter4> adapter) {
 	ComPtr<ID3D12Device5> d3d12Device5;
-	throwIfFailed(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d3d12Device5)));
+	throwIfFailed(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&d3d12Device5)));
 
 #if defined(_DEBUG)
 	ComPtr<ID3D12InfoQueue> infoQueue;
@@ -574,7 +671,7 @@ ComPtr<IDXGISwapChain4> createSwapChain(HWND hWnd,
 }
 
 ComPtr<ID3D12DescriptorHeap>
-createDescriptorHeap(ComPtr<ID3D12Device2> device, UINT numDescriptors, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+createDescriptorHeap(ComPtr<ID3D12Device5> device, UINT numDescriptors, D3D12_DESCRIPTOR_HEAP_TYPE type) {
 
 	D3D12_DESCRIPTOR_HEAP_DESC desc = {};
 	desc.Type = type;
@@ -590,7 +687,7 @@ createDescriptorHeap(ComPtr<ID3D12Device2> device, UINT numDescriptors, D3D12_DE
 }
 
 ComPtr<ID3D12CommandAllocator>
-createCommandAllocator(ComPtr<ID3D12Device2> device,
+createCommandAllocator(ComPtr<ID3D12Device5> device,
 	D3D12_COMMAND_LIST_TYPE type) {
 	ComPtr<ID3D12CommandAllocator> commandAllocator;
 	throwIfFailed(device->CreateCommandAllocator(type, IID_PPV_ARGS(&commandAllocator)));
@@ -632,21 +729,20 @@ getAdapter() {
 
 }
 
-ComPtr<ID3D12GraphicsCommandList2>
-createCommandList(ComPtr<ID3D12Device2> device,
+ComPtr<ID3D12GraphicsCommandList4>
+createCommandList(ComPtr<ID3D12Device5> device,
 	ComPtr<ID3D12CommandAllocator> commandAllocator, D3D12_COMMAND_LIST_TYPE type) {
-	ComPtr<ID3D12GraphicsCommandList2> commandList;
+	ComPtr<ID3D12GraphicsCommandList4> commandList;
 
 	throwIfFailed(device->CreateCommandList(0, type, commandAllocator.Get(), nullptr, IID_PPV_ARGS(&commandList)));
-	throwIfFailed(commandList->Close());
 
 	return commandList;
 }
 
-bool checkRayTracingSupport() {
+bool checkRayTracingSupport(ComPtr<ID3D12Device5> device) {
 	D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
 
-	throwIfFailed(gDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5)));
+	throwIfFailed(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5)));
 
 	if (options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_0) {
 		throw std::runtime_error("Raytracing not supported on device.");
@@ -685,10 +781,11 @@ createPipelineState(ComPtr<ID3D12Device5> device, ComPtr<ID3D12RootSignature> ro
 		UINT compileFlags = 0;
 	#endif
 		
-	std::filesystem::path cwd = std::filesystem::current_path() / "shaders.hlsl";
+	std::filesystem::path vertexShaderPath = std::filesystem::current_path() / "shaders" / "Vertex.hlsl";
+	std::filesystem::path pixelShaderPath = std::filesystem::current_path() / "shaders" / "Pixel.hlsl";
 
-	throwIfFailed(D3DCompileFromFile(cwd.c_str(), nullptr, nullptr, "VSMain", "vs_5_0", compileFlags, 0, &vertexShader, nullptr));
-	throwIfFailed(D3DCompileFromFile(cwd.c_str(), nullptr, nullptr, "PSMain", "ps_5_0", compileFlags, 0, &pixelShader, nullptr));
+	throwIfFailed(D3DCompileFromFile(vertexShaderPath.c_str(), nullptr, nullptr, "VSMain", "vs_5_0", compileFlags, 0, &vertexShader, nullptr));
+	throwIfFailed(D3DCompileFromFile(pixelShaderPath.c_str(), nullptr, nullptr, "PSMain", "ps_5_0", compileFlags, 0, &pixelShader, nullptr));
 
 	// Define the vertex input layout 
 	D3D12_INPUT_ELEMENT_DESC inputElementDescs[] = {
@@ -758,17 +855,6 @@ createVertexBuffer(ComPtr<ID3D12Device5> device, ComPtr<ID3D12CommandQueue> comm
 	vertexBufferView.StrideInBytes = sizeof(Vertex);
 	vertexBufferView.SizeInBytes = vertexBufferSize;
 
-	// Wait for assets to upload to GPU 
-	const UINT64 currentFenceValue = gFenceValue;
-
-	throwIfFailed(commandQueue->Signal(gFence.Get(), currentFenceValue));
-	gFenceValue++;
-
-	// Wait for prev frame to complete 
-	waitForFenceValue(gFence, currentFenceValue, gFenceEvent);
-
-	gCurrentBackBufferIndex = gSwapChain->GetCurrentBackBufferIndex();
-
 	return vertexBuffer;
 }
 
@@ -803,7 +889,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdL
 
 	gDevice = createDevice(dxgiAdapter4);
 
-	checkRayTracingSupport();
+	checkRayTracingSupport(gDevice);
 
 	gCommandQueue = createCommandQueue(gDevice, D3D12_COMMAND_LIST_TYPE_DIRECT);
 
@@ -830,6 +916,27 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdL
 	gPipelineState = createPipelineState(gDevice, gRootSignature);
 
 	gVertexBuffer = createVertexBuffer(gDevice, gCommandQueue, gVertexBufferView);
+
+	createAccelerationStructures(gDevice, gCommandList, gVertexBuffer, 
+		gTopLevelASGenerator, gBottomLevelASBuffers, gTopLevelASBuffers);
+
+	gRaytracingPipelineState = createRaytracingPipelineState(gDevice, gRayGenLibrary, gHitLibrary, 
+		gMissLibrary, gRayGenSignature, gHitSignature, gMissSignature,
+		gRaytracingStateObjectProperties);
+
+	gRaytracingOutputBuffer = createRaytracingOutputBuffer(gDevice, gClientWidth, gClientHeight);
+
+	gSrvUavHeap = createShaderResourceHeap(gDevice, gRaytracingOutputBuffer, gTopLevelASBuffers);
+
+	gSBTStorage = createShaderBindingTable(gDevice, gSBTGenerator, gSrvUavHeap, gVertexBuffer, gRaytracingStateObjectProperties);
+
+	// Flush command list to make sure everything above finished 
+	throwIfFailed(gCommandList->Close());
+	ID3D12CommandList* const commandLists[] = { gCommandList.Get() };
+	gCommandQueue->ExecuteCommandLists(_countof(commandLists), commandLists);
+
+	flush(gCommandQueue, gFence, gFenceValue, gFenceEvent);
+	gCurrentBackBufferIndex = gSwapChain->GetCurrentBackBufferIndex();
 
 	// now start the message loop
 	gIsInitialized = true;
